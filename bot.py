@@ -14,7 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal, Optional
-
+ 
 import discord
 import yt_dlp
 import aiohttp
@@ -22,12 +22,12 @@ from aiohttp import web
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-
+ 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-
+ 
 # ------------------------------------------------------------------ config
-
+ 
 DEFAULT_PREFIX = os.getenv("DEFAULT_PREFIX", "!")
 PREFIX_FILE = os.getenv("PREFIX_FILE", "prefixes.json")
 STAY_FILE = os.getenv("STAY_FILE", "247.json")
@@ -39,24 +39,25 @@ START_TIME = time.time()
 NO_COOKIE_CLIENTS = {"android_vr", "android", "ios"}  # these YouTube clients don't accept cookies
 YT_PLAYER_CLIENT = os.getenv("YT_PLAYER_CLIENT")  # optional: force one YouTube client (e.g. android_vr)
 YT_FALLBACK_CLIENTS = [c.strip() for c in os.getenv("YT_FALLBACK_CLIENTS", "android_vr,tv,mweb,web_safari").split(",") if c.strip()]
-
+ 
 YTDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
+    "ignore_no_formats_error": True,  # looking up a title shouldn't fail just because no audio format is offered right now
     "source_address": "0.0.0.0",
 }
 if YT_PLAYER_CLIENT:
     YTDL_OPTS["extractor_args"] = {"youtube": {"player_client": [YT_PLAYER_CLIENT]}}
-
-
+ 
+ 
 def find_cookies():
     """Use a YouTube cookies file if one exists (helps with 'Sign in to confirm you're not a bot').
-
+ 
     Looked up in this order: the YOUTUBE_COOKIES_B64 / YOUTUBE_COOKIES environment variables
     (handy on Railway), then a cookies.txt file."""
     dst = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")  # writable copy: yt-dlp updates cookies
-
+ 
     text = os.getenv("YOUTUBE_COOKIES")
     b64 = os.getenv("YOUTUBE_COOKIES_B64")
     if b64:
@@ -71,7 +72,7 @@ def find_cookies():
             f.write(text.strip() + "\n")
         print("Using cookies from the environment variable")
         return dst
-
+ 
     for path in (os.getenv("COOKIES_FILE"), "/etc/secrets/cookies.txt", "cookies.txt"):
         if path and os.path.isfile(path):
             shutil.copyfile(path, dst)
@@ -79,83 +80,83 @@ def find_cookies():
             return dst
     print("No cookies found (no YOUTUBE_COOKIES_B64 variable and no cookies.txt file).")
     return None
-
-
+ 
+ 
 _cookies = find_cookies()
 if _cookies:
     YTDL_OPTS["cookiefile"] = _cookies
-
+ 
 # Ways to fetch a YouTube song, tried in order if one fails: (client, use cookies?).
 # Old or invalid cookies can make YouTube refuse requests that work fine without them,
 # so the second attempt is always "default clients, no cookies".
 YT_ATTEMPTS = ([(None, True)] if _cookies else []) + [(None, False)] + [(c, False) for c in YT_FALLBACK_CLIENTS]
-
+ 
 if shutil.which("ffmpeg") is None:
     print("WARNING: ffmpeg was not found on PATH, so music cannot play. Install it, then close and reopen this window.")
-
+ 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
-
+ 
 # ---------------------------------------------------------------- prefixes
-
-
+ 
+ 
 def load_json_file(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-
-
+ 
+ 
 def save_json_file(path: str, data: dict):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, path)
-
-
+ 
+ 
 def load_prefixes() -> dict:
     return load_json_file(PREFIX_FILE)
-
-
+ 
+ 
 def save_prefixes():
     save_json_file(PREFIX_FILE, prefixes)
-
-
+ 
+ 
 def save_stay247():
     save_json_file(STAY_FILE, stay247)
-
-
+ 
+ 
 prefixes: dict[str, str] = load_prefixes()
 stay247: dict[str, int] = load_json_file(STAY_FILE)  # guild id -> voice channel id
 afk_data: dict[str, dict] = load_json_file(AFK_FILE)  # guild id -> user id -> {"reason", "since"}
 autoresponders: dict[str, dict] = load_json_file(AR_FILE)  # guild id -> trigger -> {"trigger", "response"}
-
-
+ 
+ 
 def save_afk():
     save_json_file(AFK_FILE, afk_data)
-
-
+ 
+ 
 def save_autoresponders():
     save_json_file(AR_FILE, autoresponders)
-
-
+ 
+ 
 def prefix_for(guild: discord.Guild | None) -> str:
     if guild is None:
         return DEFAULT_PREFIX
     return prefixes.get(str(guild.id), DEFAULT_PREFIX)
-
-
+ 
+ 
 async def get_prefix(bot, message: discord.Message):
     # Mentioning the bot always works, so a forgotten prefix can be recovered
     return commands.when_mentioned_or(prefix_for(message.guild))(bot, message)
-
-
+ 
+ 
 # ------------------------------------------------------------------- state
-
-
+ 
+ 
 @dataclass
 class Track:
     title: str
@@ -174,8 +175,8 @@ class Track:
     attempt: int = 0  # how many fallback YouTube clients have been tried for this song
     likes: set = field(default_factory=set)
     dislikes: set = field(default_factory=set)
-
-
+ 
+ 
 class GuildState:
     def __init__(self):
         self.queue: deque[Track] = deque()
@@ -195,20 +196,20 @@ class GuildState:
         self.start_offset: int = 0  # seconds to skip into the next song (seek)
         self.position_anchor: float = 0.0  # playback position at anchor_time
         self.anchor_time: float | None = None  # monotonic time of anchor, None while paused
-
-
+ 
+ 
 states: dict[int, GuildState] = {}
-
-
+ 
+ 
 def get_state(guild_id: int) -> GuildState:
     return states.setdefault(guild_id, GuildState())
-
-
+ 
+ 
 # ------------------------------------------------------------ message style
-
+ 
 PLAYER_NAME = "Mannat Player"
 PLAYER_EMOJI = "🌸"  # shown next to the bot's name everywhere
-
+ 
 COLORS = {  # soft pastel palette, one shade per kind of message
     "pink": 0xFFB3C6, "rose": 0xFFC8DD, "blush": 0xFFB7B2, "peach": 0xFFCBA4, "apricot": 0xFFD6A5,
     "cream": 0xFFE5D9, "butter": 0xFDFFB6, "lemon": 0xFFF1B5, "sage": 0xCAFFBF, "mint": 0xB5EAD7,
@@ -219,33 +220,33 @@ COLORS = {  # soft pastel palette, one shade per kind of message
     "pistachio": 0xDCEDC8, "rosewater": 0xF8D7DA, "ice": 0xC4E3F3, "taffy": 0xF7C8E0,
 }
 PANEL_COLOR = COLORS["pink"]
-
+ 
 KINDS = {  # kind -> (emoji, color)
     "success": ("✅", COLORS["mint"]),
     "error": ("❌", COLORS["coral"]),
     "warn": ("⚠️", COLORS["butter"]),
     "info": ("✨", COLORS["lilac"]),
 }
-
-
+ 
+ 
 def msg_embed(text: str, kind: str = "info", title: str | None = None, color: int | None = None) -> discord.Embed:
     emoji, default = KINDS[kind]
     return discord.Embed(title=title, description=f"{emoji}  {text}", color=discord.Color(color if color is not None else default))
-
-
+ 
+ 
 async def reply(ctx: commands.Context, text: str, kind: str = "info", title: str | None = None,
                 ephemeral: bool = False, color: int | None = None):
     return await ctx.send(embed=msg_embed(text, kind, title, color), ephemeral=ephemeral)
-
-
+ 
+ 
 async def ireply(interaction: discord.Interaction, text: str, kind: str = "error", title: str | None = None):
     """Private (only-you-can-see) reply to a button or menu press."""
     await interaction.response.send_message(embed=msg_embed(text, kind, title), ephemeral=True)
-
-
+ 
+ 
 # --------------------------------------------------------------------- bot
-
-
+ 
+ 
 async def start_web_server():
     """Tiny health-check page so hosts like Render (and uptime pingers) can reach the bot."""
     app = web.Application()
@@ -253,33 +254,33 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ["PORT"])).start()
-
-
+ 
+ 
 class MusicBot(commands.Bot):
     async def setup_hook(self):
         voice_maintenance.start()
         player_refresh.start()
         await self.tree.sync()  # register slash commands
-
-
+ 
+ 
 intents = discord.Intents.default()
 intents.message_content = True  # required for prefix commands (enable it in the Developer Portal too)
 bot = MusicBot(command_prefix=get_prefix, intents=intents, help_command=None)
-
-
+ 
+ 
 @bot.check
 async def servers_only(ctx: commands.Context):
     if ctx.guild is None:
         raise commands.NoPrivateMessage()
     return True
-
-
+ 
+ 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="/play | /help"))
-
-
+ 
+ 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -300,8 +301,8 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print(f"Message handler error: {e!r}")
     await bot.process_commands(message)
-
-
+ 
+ 
 @tasks.loop(seconds=30)
 async def voice_maintenance():
     # 1) Leave idle or empty channels (skipped for servers with 24/7 mode on)
@@ -320,7 +321,7 @@ async def voice_maintenance():
             state.idle_since = None
             await update_voice_status(vc.guild, None)
             await vc.disconnect()
-
+ 
     # 2) 24/7 servers: follow the bot if it was moved, and rejoin if it got disconnected
     changed = False
     for key, channel_id in list(stay247.items()):
@@ -347,13 +348,13 @@ async def voice_maintenance():
             print(f"24/7: could not rejoin {channel.name} in {guild.name}: {e}")
     if changed:
         save_stay247()
-
-
+ 
+ 
 @voice_maintenance.before_loop
 async def before_voice_maintenance():
     await bot.wait_until_ready()
-
-
+ 
+ 
 @tasks.loop(seconds=10)
 async def player_refresh():
     """Keep the progress bar on the player message moving."""
@@ -369,13 +370,13 @@ async def player_refresh():
             state.player_message = None
         except discord.HTTPException:
             pass
-
-
+ 
+ 
 @player_refresh.before_loop
 async def before_player_refresh():
     await bot.wait_until_ready()
-
-
+ 
+ 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
@@ -384,7 +385,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         error = error.original
     if isinstance(error, commands.CommandInvokeError):
         error = error.original
-
+ 
     if isinstance(error, commands.MissingPermissions):
         perms = ", ".join(p.replace("_", " ").title() for p in error.missing_permissions)
         msg = f"You need the **{perms}** permission to use this command."
@@ -408,36 +409,36 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         await reply(ctx, msg, "error", ephemeral=True)
     except discord.HTTPException:
         pass
-
-
+ 
+ 
 # ----------------------------------------------------------------- helpers
-
-
+ 
+ 
 def build_query(query: str, source: str = "youtube") -> str:
     """Links are used as-is; plain text becomes a search on the chosen source."""
     if query.startswith(("http://", "https://")):
         return query
     prefix = "ytsearch5:" if source == "youtube" else "scsearch5:"
     return prefix + query
-
-
+ 
+ 
 def parse_source(query: str) -> tuple[str, str]:
     """'sc: song' -> soundcloud, 'yt: song' -> youtube, otherwise YouTube."""
     m = re.match(r"^(yt|youtube|sc|soundcloud)\s*:\s*(.+)$", query.strip(), re.IGNORECASE | re.DOTALL)
     if m:
         return ("youtube" if m.group(1).lower() in ("yt", "youtube") else "soundcloud"), m.group(2).strip()
     return "youtube", query.strip()
-
-
+ 
+ 
 async def extract(query: str, exclude: set | None = None) -> dict:
     loop = asyncio.get_running_loop()
-
+ 
     def run(base):
         is_search = query.startswith(("scsearch", "ytsearch"))
         opts = {**base, "extract_flat": "in_playlist"} if is_search else base
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
-
+ 
         if "entries" not in info:
             return info
         entries = [e for e in info["entries"] if e]
@@ -445,7 +446,7 @@ async def extract(query: str, exclude: set | None = None) -> dict:
             raise ValueError("No results found")
         if not is_search:
             return entries[0]
-
+ 
         # Search: try the results in order and use the first one that is playable.
         # Some results are DRM-protected, geo-blocked or removed.
         last_error = None
@@ -464,7 +465,7 @@ async def extract(query: str, exclude: set | None = None) -> dict:
                     if "not a bot" in str(e):  # YouTube is blocking us; trying more results only makes it worse
                         break
         raise last_error or ValueError("No playable results found")
-
+ 
     try:
         return await loop.run_in_executor(None, run, YTDL_OPTS)
     except Exception as e:
@@ -473,8 +474,8 @@ async def extract(query: str, exclude: set | None = None) -> dict:
             print("Request failed with cookies; retrying without them")
             return await loop.run_in_executor(None, run, {k: v for k, v in YTDL_OPTS.items() if k != "cookiefile"})
         raise
-
-
+ 
+ 
 def fmt_duration(seconds) -> str:
     if not seconds:
         return "Unknown"
@@ -484,8 +485,8 @@ def fmt_duration(seconds) -> str:
     if hours:
         return f"{hours}h {minutes}m {secs}s"
     return f"{minutes}m {secs}s"
-
-
+ 
+ 
 def track_from_info(info: dict, user: discord.abc.User) -> Track:
     artist = info.get("artist") or info.get("creator") or info.get("uploader") or info.get("channel") or "Unknown"
     artist = re.sub(r"\s*-\s*Topic$", "", artist)
@@ -500,8 +501,8 @@ def track_from_info(info: dict, user: discord.abc.User) -> Track:
         thumbnail=info.get("thumbnail"),
         video_id=info.get("id"),
     )
-
-
+ 
+ 
 def track_embed(track: Track, title: str) -> discord.Embed:
     """Compact card shown when a song is added to the queue."""
     embed = discord.Embed(
@@ -519,15 +520,15 @@ def track_embed(track: Track, title: str) -> discord.Embed:
         embed.set_thumbnail(url=track.thumbnail)
     embed.set_footer(text=PLAYER_NAME)
     return embed
-
-
+ 
+ 
 def fmt_clock(seconds) -> str:
     seconds = max(0, int(seconds))
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
-
-
+ 
+ 
 def current_position(state: "GuildState", track: Track) -> float:
     pos = state.position_anchor
     if state.anchor_time is not None:
@@ -535,26 +536,26 @@ def current_position(state: "GuildState", track: Track) -> float:
     if track.duration:
         pos = min(pos, float(track.duration))
     return max(0.0, pos)
-
-
+ 
+ 
 def mark_paused(state: "GuildState"):
     if state.anchor_time is not None:
         state.position_anchor += time.monotonic() - state.anchor_time
         state.anchor_time = None
-
-
+ 
+ 
 def mark_resumed(state: "GuildState"):
     if state.anchor_time is None:
         state.anchor_time = time.monotonic()
-
-
+ 
+ 
 def progress_bar(pos: float, total, width: int = 13) -> str:
     if not total:
         return "🔘" + "▬" * (width - 1)
     idx = min(int(max(0.0, min(1.0, pos / total)) * width), width - 1)
     return "▬" * idx + "🔘" + "▬" * (width - 1 - idx)
-
-
+ 
+ 
 def now_playing_embed(track: Track, state: "GuildState") -> discord.Embed:
     pos = current_position(state, track)
     total = fmt_clock(track.duration) if track.duration else "LIVE"
@@ -580,8 +581,8 @@ def now_playing_embed(track: Track, state: "GuildState") -> discord.Embed:
         text=f"{PLAYER_NAME}  •  👍 {len(track.likes)}  👎 {len(track.dislikes)}  •  Autoplay {'ON' if state.autoplay else 'OFF'}"
     )
     return embed
-
-
+ 
+ 
 def queue_embed(state: "GuildState") -> discord.Embed:
     embed = discord.Embed(title="📜 Queue", color=discord.Color(COLORS["sky"]))
     embed.set_author(name=f"{PLAYER_EMOJI} {PLAYER_NAME}")
@@ -612,27 +613,27 @@ def queue_embed(state: "GuildState") -> discord.Embed:
              f"Loop: {state.loop}  •  Volume: {int(state.volume * 100)}%"
     )
     return embed
-
-
+ 
+ 
 def apply_volume(vc, state: "GuildState"):
     if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
         vc.source.volume = state.volume  # applies instantly to the current song
-
-
+ 
+ 
 class PlayerView(discord.ui.View):
     """The button panel under the Now Playing message."""
-
+ 
     def __init__(self, state: "GuildState"):
         super().__init__(timeout=None)
         self.state = state
         self.sync_buttons()
-
+ 
     def sync_buttons(self):
         paused = self.state.anchor_time is None
         self.pause_btn.emoji = "▶️" if paused else "⏸️"
         self.loop_btn.style = discord.ButtonStyle.success if self.state.loop != "off" else discord.ButtonStyle.secondary
         self.autoplay_btn.style = discord.ButtonStyle.success if self.state.autoplay else discord.ButtonStyle.secondary
-
+ 
     async def guard(self, interaction: discord.Interaction):
         """Controls only work for people in the bot's voice channel."""
         vc = interaction.guild.voice_client if interaction.guild else None
@@ -641,14 +642,14 @@ class PlayerView(discord.ui.View):
             await ireply(interaction, "Join my voice channel to use the controls.")
             return None
         return vc
-
+ 
     async def update(self, interaction: discord.Interaction):
         self.sync_buttons()
         if self.state.current:
             await interaction.response.edit_message(embed=now_playing_embed(self.state.current, self.state), view=self)
         else:
             await interaction.response.defer()
-
+ 
     # ---- row 1: previous, pause/resume, next, shuffle, loop
     @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
     async def previous_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -667,7 +668,7 @@ class PlayerView(discord.ui.View):
         state.going_back = True
         await interaction.response.defer()
         vc.stop()
-
+ 
     @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary, row=0)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = await self.guard(interaction)
@@ -682,7 +683,7 @@ class PlayerView(discord.ui.View):
         else:
             return await ireply(interaction, "Nothing is playing.")
         await self.update(interaction)
-
+ 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = await self.guard(interaction)
@@ -693,7 +694,7 @@ class PlayerView(discord.ui.View):
         self.state.skip_requested = True
         await interaction.response.defer()
         vc.stop()
-
+ 
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
@@ -704,7 +705,7 @@ class PlayerView(discord.ui.View):
         random.shuffle(items)
         self.state.queue = deque(items)
         await self.update(interaction)
-
+ 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=0)
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
@@ -712,7 +713,7 @@ class PlayerView(discord.ui.View):
         order = ["off", "track", "queue"]
         self.state.loop = order[(order.index(self.state.loop) + 1) % 3]
         await self.update(interaction)
-
+ 
     # ---- row 2: volume down/up, queue, autoplay, stop
     @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
     async def vol_down_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -722,7 +723,7 @@ class PlayerView(discord.ui.View):
         self.state.volume = max(0.0, round(self.state.volume - 0.1, 2))
         apply_volume(vc, self.state)
         await self.update(interaction)
-
+ 
     @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
     async def vol_up_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = await self.guard(interaction)
@@ -731,18 +732,18 @@ class PlayerView(discord.ui.View):
         self.state.volume = min(1.0, round(self.state.volume + 0.1, 2))
         apply_volume(vc, self.state)
         await self.update(interaction)
-
+ 
     @discord.ui.button(emoji="📜", style=discord.ButtonStyle.secondary, row=1)
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(embed=queue_embed(self.state), ephemeral=True)
-
+ 
     @discord.ui.button(emoji="✨", style=discord.ButtonStyle.secondary, row=1)
     async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.guard(interaction):
             return
         self.state.autoplay = not self.state.autoplay
         await self.update(interaction)
-
+ 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = await self.guard(interaction)
@@ -754,7 +755,7 @@ class PlayerView(discord.ui.View):
         if vc.is_playing() or vc.is_paused():
             vc.stop()
         await close_player(self.state)
-
+ 
     # ---- row 3: rewind, forward, like, dislike
     async def seek(self, interaction: discord.Interaction, delta: int):
         vc = await self.guard(interaction)
@@ -773,15 +774,15 @@ class PlayerView(discord.ui.View):
         state.anchor_time = time.monotonic()
         await self.update(interaction)
         vc.stop()
-
+ 
     @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.secondary, row=2)
     async def rewind_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.seek(interaction, -10)
-
+ 
     @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.secondary, row=2)
     async def forward_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.seek(interaction, 10)
-
+ 
     @discord.ui.button(emoji="👍", style=discord.ButtonStyle.secondary, row=2)
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         track, uid = self.state.current, interaction.user.id
@@ -792,7 +793,7 @@ class PlayerView(discord.ui.View):
                 track.likes.add(uid)
                 track.dislikes.discard(uid)
         await self.update(interaction)
-
+ 
     @discord.ui.button(emoji="👎", style=discord.ButtonStyle.secondary, row=2)
     async def dislike_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         track, uid = self.state.current, interaction.user.id
@@ -803,8 +804,8 @@ class PlayerView(discord.ui.View):
                 track.dislikes.add(uid)
                 track.likes.discard(uid)
         await self.update(interaction)
-
-
+ 
+ 
 async def delete_player(state: "GuildState"):
     if state.player_view:
         state.player_view.stop()
@@ -815,8 +816,8 @@ async def delete_player(state: "GuildState"):
         except discord.HTTPException:
             pass
         state.player_message = None
-
-
+ 
+ 
 async def close_player(state: "GuildState"):
     """Remove the buttons when playback is over (the message itself stays)."""
     if state.player_view:
@@ -828,8 +829,8 @@ async def close_player(state: "GuildState"):
         except discord.HTTPException:
             pass
         state.player_message = None
-
-
+ 
+ 
 async def refresh_player(state: "GuildState"):
     """Re-draw the player message after a slash/prefix command changed something."""
     if not (state.player_message and state.current):
@@ -844,8 +845,8 @@ async def refresh_player(state: "GuildState"):
         state.player_message = None
     except discord.HTTPException:
         pass
-
-
+ 
+ 
 async def post_player(state: "GuildState", track: Track, send):
     """Send a fresh player message with `send` (channel.send or ctx.send), replacing the old one."""
     await delete_player(state)
@@ -855,8 +856,8 @@ async def post_player(state: "GuildState", track: Track, send):
     # Use a partial message so later edits keep working after interaction tokens expire
     channel = state.notify_channel
     state.player_message = channel.get_partial_message(msg.id) if channel else msg
-
-
+ 
+ 
 async def announce_track(state: "GuildState", track: Track):
     if not state.notify_channel:
         return
@@ -864,8 +865,8 @@ async def announce_track(state: "GuildState", track: Track):
         await post_player(state, track, state.notify_channel.send)
     except discord.HTTPException:
         pass
-
-
+ 
+ 
 async def autoplay_next(guild: discord.Guild, finished: Track) -> bool:
     """When the queue runs dry and Autoplay is on, queue another song by the same artist."""
     state = get_state(guild.id)
@@ -885,18 +886,18 @@ async def autoplay_next(guild: discord.Guild, finished: Track) -> bool:
     track.requester_mention = "✨ Autoplay"
     state.queue.append(track)
     return True
-
-
+ 
+ 
 background_tasks: set = set()
-
-
+ 
+ 
 def spawn(coro):
     """Run a coroutine in the background without blocking playback."""
     task = asyncio.get_running_loop().create_task(coro)
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
-
-
+ 
+ 
 async def set_channel_status(channel: discord.VoiceChannel, text: str | None):
     try:
         await channel.edit(status=text or None)
@@ -906,8 +907,8 @@ async def set_channel_status(channel: discord.VoiceChannel, text: str | None):
             Route("PUT", "/channels/{channel_id}/voice-status", channel_id=channel.id),
             json={"status": text or None},
         )
-
-
+ 
+ 
 async def update_voice_status(guild: discord.Guild, text: str | None):
     """Set (or clear, with None) the status line shown under the voice channel's name. Never raises."""
     vc = guild.voice_client
@@ -933,19 +934,19 @@ async def update_voice_status(guild: discord.Guild, text: str | None):
             await notify(state, "I need the **Set Voice Channel Status** permission to show the current song in the channel status.")
     except Exception as e:
         print(f"Could not update voice channel status: {e!r}")
-
-
+ 
+ 
 async def notify(state: GuildState, text: str):
     if state.notify_channel:
         try:
             await state.notify_channel.send(embed=msg_embed(text[:1900], "error"))
         except discord.HTTPException:
             pass
-
-
+ 
+ 
 async def play_next(guild: discord.Guild, announce: bool = False):
     state = get_state(guild.id)
-
+ 
     finished = state.current
     going_back = state.going_back  # set by previous/seek buttons: replay instead of finishing
     state.going_back = False
@@ -958,25 +959,25 @@ async def play_next(guild: discord.Guild, announce: bool = False):
         elif state.loop == "queue":
             state.queue.append(finished)
     state.skip_requested = False
-
+ 
     vc = guild.voice_client
     if vc and finished and not going_back and not state.queue:
         await autoplay_next(guild, finished)
-
+ 
     if not vc or not state.queue:
         state.current = None
         if vc:
             spawn(update_voice_status(guild, None))
         await close_player(state)
         return
-
+ 
     track = state.queue.popleft()
     state.current = track
     if track is finished:  # same song again (loop or seek): don't post a new player message
         announce = False
     offset = state.start_offset
     state.start_offset = 0
-
+ 
     ffmpeg_err = tempfile.TemporaryFile()  # lets us show ffmpeg's own error message
     ytdlp_err = None
     ytdlp_proc = None
@@ -1025,10 +1026,10 @@ async def play_next(guild: discord.Guild, announce: bool = False):
         state.current = None  # don't loop a broken track
         await notify(state, f"Couldn't play **{track.title}**: `{e}`")
         return await play_next(guild, announce=announce)
-
+ 
     started = time.monotonic()
     print(f"Playing: {track.title} [{track.platform}] length={fmt_duration(track.duration)} from {offset}s")
-
+ 
     def read_log(f) -> str:
         try:
             f.seek(0)
@@ -1037,7 +1038,7 @@ async def play_next(guild: discord.Guild, announce: bool = False):
             return text
         except Exception:
             return ""
-
+ 
     def after(err):
         elapsed = time.monotonic() - started
         print(f"Playback finished after {elapsed:.1f}s (error: {err})")
@@ -1063,13 +1064,13 @@ async def play_next(guild: discord.Guild, announce: bool = False):
             resume_at = int(offset + elapsed)
             next_client, next_cookies = YT_ATTEMPTS[track.attempt]
             print(f"YouTube refused the audio; retrying from {resume_at}s with client '{next_client or 'default'}', cookies {'on' if next_cookies else 'off'}")
-
+ 
             async def retry():
                 state.queue.appendleft(track)
                 state.start_offset = resume_at
                 state.going_back = True  # replay the same song instead of finishing it
                 await play_next(guild)
-
+ 
             asyncio.run_coroutine_threadsafe(retry(), bot.loop)
             return
         if forbidden and not bot_check:
@@ -1093,17 +1094,17 @@ async def play_next(guild: discord.Guild, announce: bool = False):
                 bot.loop,
             )
         asyncio.run_coroutine_threadsafe(play_next(guild, announce=True), bot.loop)
-
+ 
     vc.play(source, after=after)
     state.position_anchor = float(offset)
     state.anchor_time = time.monotonic()
     spawn(update_voice_status(guild, f"{STATUS_EMOJI} Vibing to {track.title}"))
     if announce:
         await announce_track(state, track)
-
-
+ 
+ 
 # ------------------------------------------------------- spotify & playlists
-
+ 
 MAX_PLAYLIST = 100  # most tracks added from one playlist link
 SPOTIFY_RE = re.compile(r"open\.spotify\.com/(?:intl-[a-z\-]+/)?(track|album|playlist)/([A-Za-z0-9]{22})", re.I)
 SPOTIFY_URI_RE = re.compile(r"^spotify:(track|album|playlist):([A-Za-z0-9]{22})$", re.I)
@@ -1112,8 +1113,8 @@ SPOTIFY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 }
-
-
+ 
+ 
 def dig(obj, *path):
     """Safely read obj[a][b][c]..., returning None if anything is missing."""
     for key in path:
@@ -1122,8 +1123,8 @@ def dig(obj, *path):
         except (KeyError, IndexError, TypeError):
             return None
     return obj
-
-
+ 
+ 
 async def parse_spotify_link(query: str):
     """Return (kind, id) for a Spotify track/album/playlist link, or None."""
     q = query.strip()
@@ -1136,8 +1137,8 @@ async def parse_spotify_link(query: str):
             return None
     m = SPOTIFY_RE.search(q) or SPOTIFY_URI_RE.match(q)
     return (m.group(1).lower(), m.group(2)) if m else None
-
-
+ 
+ 
 def find_spotify_entity(data):
     """Find the part of the page data that describes the track, album or playlist."""
     entity = dig(data, "props", "pageProps", "state", "data", "entity")
@@ -1153,8 +1154,8 @@ def find_spotify_entity(data):
         elif isinstance(cur, list):
             stack.extend(cur)
     return None
-
-
+ 
+ 
 def spotify_track_info(t: dict) -> dict:
     title = (t.get("title") or t.get("name") or "").strip()
     artist = t.get("subtitle")
@@ -1167,8 +1168,8 @@ def spotify_track_info(t: dict) -> dict:
     dur = (int(dur / 1000) if dur > 1000 else int(dur)) if isinstance(dur, (int, float)) else None
     uri = t.get("uri") or ""
     return {"title": title, "artist": artist, "duration": dur, "id": uri.split(":")[-1] if uri.startswith("spotify:track:") else None}
-
-
+ 
+ 
 def parse_spotify_embed(page: str, kind: str, sid: str) -> dict:
     m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page, re.S)
     if m:
@@ -1201,8 +1202,8 @@ def parse_spotify_embed(page: str, kind: str, sid: str) -> dict:
             "tracks": [{"title": html_lib.unescape(title.group(1)), "artist": artist or "Unknown", "duration": None, "id": sid}],
         }
     raise ValueError("I couldn't read that Spotify link. It may be private, or Spotify changed its page.")
-
-
+ 
+ 
 async def load_spotify(kind: str, sid: str, user: discord.abc.User):
     """Read a Spotify link and turn it into queue entries that are matched to YouTube when played."""
     async with aiohttp.ClientSession(headers=SPOTIFY_HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as sess:
@@ -1230,22 +1231,22 @@ async def load_spotify(kind: str, sid: str, user: discord.abc.User):
     ]
     meta = {"kind": kind, "name": data["name"], "url": url, "image": data["image"], "origin": "Spotify → YouTube"}
     return meta, tracks
-
-
+ 
+ 
 def is_playlist_url(q: str) -> bool:
     u = q.lower()
     return u.startswith(("http://", "https://")) and ("youtube.com/playlist" in u or ("soundcloud.com/" in u and "/sets/" in u))
-
-
+ 
+ 
 async def load_playlist(url: str, user: discord.abc.User):
     """Queue every track of a YouTube or SoundCloud playlist link."""
     loop = asyncio.get_running_loop()
-
+ 
     def run():
         opts = {**YTDL_OPTS, "noplaylist": False, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST}
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
-
+ 
     info = await loop.run_in_executor(None, run)
     entries = [e for e in (info.get("entries") or []) if e and e.get("title") not in ("[Private video]", "[Deleted video]")]
     default_platform = (info.get("extractor_key") or "Unknown").upper()
@@ -1283,8 +1284,8 @@ async def load_playlist(url: str, user: discord.abc.User):
         "origin": tracks[0].platform.title(),
     }
     return meta, tracks
-
-
+ 
+ 
 async def resolve_track(track: Track):
     """Spotify entries are matched to a YouTube video just before they play."""
     if track.search_query:
@@ -1301,8 +1302,8 @@ async def resolve_track(track: Track):
         track.thumbnail = track.thumbnail or info.get("thumbnail")
         track.video_id = info.get("id")
     track.resolved = True
-
-
+ 
+ 
 def playlist_embed(meta: dict, tracks: list, position: int | None) -> discord.Embed:
     n = len(tracks)
     who = tracks[0].requester_mention or tracks[0].requester
@@ -1325,31 +1326,31 @@ def playlist_embed(meta: dict, tracks: list, position: int | None) -> discord.Em
     note = f"  •  Limited to the first {MAX_PLAYLIST} tracks" if n >= MAX_PLAYLIST else ""
     embed.set_footer(text=f"{PLAYER_NAME}{note}")
     return embed
-
-
+ 
+ 
 # ---------------------------------------------------------------- playback
-
-
+ 
+ 
 @bot.hybrid_command(name="play", aliases=["p"], description="Play a song, Spotify link or playlist (YouTube by default)")
 @app_commands.describe(query="Song name, or a YouTube/SoundCloud/Spotify link or playlist. Start with 'sc:' to search SoundCloud")
 async def play(ctx: commands.Context, *, query: str):
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await reply(ctx, "Join a voice channel first.", "error", ephemeral=True)
-
+ 
     await ctx.defer()
     channel = ctx.author.voice.channel
     guild = ctx.guild
-
+ 
     vc = guild.voice_client
     if vc is None:
         vc = await channel.connect()
     elif vc.channel != channel:
         await vc.move_to(channel)
-
+ 
     state = get_state(guild.id)
     state.notify_channel = ctx.channel
     query = query.strip()
-
+ 
     meta, tracks = None, []
     try:
         spotify = await parse_spotify_link(query)
@@ -1371,25 +1372,25 @@ async def play(ctx: commands.Context, *, query: str):
             tracks = [track_from_info(info, ctx.author)]
     except Exception as e:
         return await reply(ctx, f"Couldn't find that track.\n```{str(e)[:500]}```", "error")
-
+ 
     is_bulk = meta is not None and meta["kind"] != "track"
     was_busy = vc.is_playing() or vc.is_paused()
     first_position = len(state.queue) + 1
     state.queue.extend(tracks)
-
+ 
     if is_bulk:
         await ctx.send(embed=playlist_embed(meta, tracks, first_position if was_busy else None))
     elif was_busy:
         await ctx.send(embed=track_embed(tracks[0], f"✅  Added to Queue  ·  position {first_position}"))
-
+ 
     if not was_busy:
         await play_next(guild)
         if state.current:
             await post_player(state, state.current, ctx.send)
         else:
             await reply(ctx, "I couldn't start that track. See the message above for details.", "error")
-
-
+ 
+ 
 @bot.hybrid_command(name="skip", aliases=["s"], description="Skip the current song")
 async def skip(ctx: commands.Context):
     vc = ctx.voice_client
@@ -1401,8 +1402,8 @@ async def skip(ctx: commands.Context):
         await reply(ctx, f"Skipped **{skipped.title[:100]}**" if skipped else "Skipped.", "success", color=COLORS["peach"])
     else:
         await reply(ctx, "Nothing is playing.", "error", ephemeral=True)
-
-
+ 
+ 
 @bot.hybrid_command(name="pause", description="Pause playback")
 async def pause(ctx: commands.Context):
     vc = ctx.voice_client
@@ -1413,8 +1414,8 @@ async def pause(ctx: commands.Context):
         await refresh_player(get_state(ctx.guild.id))
     else:
         await reply(ctx, "Nothing is playing.", "error", ephemeral=True)
-
-
+ 
+ 
 @bot.hybrid_command(name="resume", description="Resume playback")
 async def resume(ctx: commands.Context):
     vc = ctx.voice_client
@@ -1425,8 +1426,8 @@ async def resume(ctx: commands.Context):
         await refresh_player(get_state(ctx.guild.id))
     else:
         await reply(ctx, "Nothing is paused.", "error", ephemeral=True)
-
-
+ 
+ 
 @bot.hybrid_command(name="stop", description="Stop playback and clear the queue (stays in the channel)")
 async def stop(ctx: commands.Context):
     state = get_state(ctx.guild.id)
@@ -1436,8 +1437,8 @@ async def stop(ctx: commands.Context):
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
     await reply(ctx, "Stopped playback and cleared the queue.", "success", "⏹️  Stopped", color=COLORS["blush"])
-
-
+ 
+ 
 @bot.hybrid_command(name="leave", aliases=["disconnect"], description="Disconnect the bot from voice")
 async def leave(ctx: commands.Context):
     state = get_state(ctx.guild.id)
@@ -1454,16 +1455,16 @@ async def leave(ctx: commands.Context):
         await reply(ctx, "Left the voice channel." + ("\n24/7 mode is now **off**." if was_247 else ""), "success", "👋  Disconnected", color=COLORS["cream"])
     else:
         await reply(ctx, "I'm not in a voice channel.", "error", ephemeral=True)
-
-
+ 
+ 
 # ------------------------------------------------------------------- queue
-
-
+ 
+ 
 @bot.hybrid_command(name="queue", aliases=["q"], description="Show the queue")
 async def queue_cmd(ctx: commands.Context):
     await ctx.send(embed=queue_embed(get_state(ctx.guild.id)))
-
-
+ 
+ 
 @bot.hybrid_command(name="nowplaying", aliases=["np"], description="Show the current song")
 async def nowplaying(ctx: commands.Context):
     state = get_state(ctx.guild.id)
@@ -1471,8 +1472,8 @@ async def nowplaying(ctx: commands.Context):
         await ctx.send(embed=now_playing_embed(state.current, state))
     else:
         await reply(ctx, "Nothing is playing.", "error", ephemeral=True)
-
-
+ 
+ 
 @bot.hybrid_command(name="shuffle", description="Shuffle the upcoming songs in the queue")
 async def shuffle(ctx: commands.Context):
     state = get_state(ctx.guild.id)
@@ -1483,19 +1484,19 @@ async def shuffle(ctx: commands.Context):
     state.queue = deque(items)
     await reply(ctx, f"Shuffled **{len(items)}** songs.", "success", "🔀  Shuffled", color=COLORS["orchid"])
     await refresh_player(state)
-
-
+ 
+ 
 def remove_track(state: GuildState, track: Track) -> bool:
     for i, t in enumerate(state.queue):
         if t is track:
             del state.queue[i]
             return True
     return False
-
-
+ 
+ 
 class RemoveView(discord.ui.View):
     """Dropdown listing the queue so a song can be picked and removed."""
-
+ 
     def __init__(self, author_id: int, state: GuildState):
         super().__init__(timeout=60)
         self.author_id = author_id
@@ -1513,7 +1514,7 @@ class RemoveView(discord.ui.View):
         select = discord.ui.Select(placeholder="Choose a song to remove...", options=options)
         select.callback = self.on_select
         self.add_item(select)
-
+ 
     async def on_select(self, interaction: discord.Interaction):
         track = self.snapshot[int(interaction.data["values"][0])]
         if remove_track(self.state, track):
@@ -1523,28 +1524,28 @@ class RemoveView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=None)
         self.stop()
         await refresh_player(self.state)
-
+ 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await ireply(interaction, "This menu belongs to someone else. Run the remove command yourself.")
             return False
         return True
-
+ 
     async def on_timeout(self):
         if self.message:
             try:
                 await self.message.edit(content=None, embed=msg_embed("This menu timed out.", "warn"), view=None)
             except discord.HTTPException:
                 pass
-
-
+ 
+ 
 @bot.hybrid_command(name="remove", aliases=["rm"], description="Remove a song from the queue")
 @app_commands.describe(position="Queue number to remove (leave empty to pick from a list)")
 async def remove(ctx: commands.Context, position: Optional[int] = None):
     state = get_state(ctx.guild.id)
     if not state.queue:
         return await reply(ctx, "The queue is empty, so there's nothing to remove.", "error", ephemeral=True)
-
+ 
     if position is None:
         note = "\n*Showing the first 25. Use `/remove <number>` for the rest.*" if len(state.queue) > 25 else ""
         view = RemoveView(ctx.author.id, state)
@@ -1553,15 +1554,15 @@ async def remove(ctx: commands.Context, position: Optional[int] = None):
             view=view,
         )
         return
-
+ 
     if not 1 <= position <= len(state.queue):
         return await reply(ctx, f"Pick a number between 1 and {len(state.queue)}.", "error", ephemeral=True)
     track = state.queue[position - 1]
     del state.queue[position - 1]
     await reply(ctx, f"Removed **{track.title[:100]}** from the queue.", "success", "🗑️  Removed", color=COLORS["wisteria"])
     await refresh_player(state)
-
-
+ 
+ 
 @remove.autocomplete("position")
 async def remove_autocomplete(interaction: discord.Interaction, current: str):
     if not interaction.guild:
@@ -1574,11 +1575,11 @@ async def remove_autocomplete(interaction: discord.Interaction, current: str):
         if len(choices) >= 25:
             break
     return choices
-
-
+ 
+ 
 # ---------------------------------------------------------------- settings
-
-
+ 
+ 
 @bot.hybrid_command(name="loop", description="Set loop mode: off, current track, or whole queue")
 @app_commands.describe(mode="What to loop: off, track, or queue")
 async def loop_cmd(ctx: commands.Context, mode: Literal["off", "track", "queue"]):
@@ -1586,8 +1587,8 @@ async def loop_cmd(ctx: commands.Context, mode: Literal["off", "track", "queue"]
     labels = {"off": "Loop is **off**.", "track": "Looping the **current track**.", "queue": "Looping the **whole queue**."}
     await reply(ctx, labels[mode], "success", "🔁  Loop", color=COLORS["aqua"])
     await refresh_player(get_state(ctx.guild.id))
-
-
+ 
+ 
 @bot.hybrid_command(name="volume", aliases=["vol"], description="Set the volume (0-100)")
 @app_commands.describe(level="Volume from 0 to 100")
 async def volume(ctx: commands.Context, level: commands.Range[int, 0, 100]):
@@ -1598,18 +1599,18 @@ async def volume(ctx: commands.Context, level: commands.Range[int, 0, 100]):
         vc.source.volume = state.volume  # applies instantly to the current song
     await reply(ctx, f"Volume set to **{level}%**.", "success", "🔊  Volume", color=COLORS["seafoam"])
     await refresh_player(state)
-
-
+ 
+ 
 # -------------------------------------------------------------------- roles
-
+ 
 ROLE_DECOR = "๑•.୨୧ \u200b"  # characters around the keyword, e.g. "๑•.୨ baddiez ୧•."
-
-
+ 
+ 
 def role_core(name: str) -> str:
     """'๑•.୨ baddiez ୧•.' -> 'baddiez'"""
     return name.strip(ROLE_DECOR).strip().lower()
-
-
+ 
+ 
 def find_roles(guild: discord.Guild, keyword: str) -> list[discord.Role]:
     kw = keyword.strip(ROLE_DECOR).strip().lower()
     if not kw:
@@ -1619,8 +1620,8 @@ def find_roles(guild: discord.Guild, keyword: str) -> list[discord.Role]:
     if same:
         return same
     return [r for r in roles if kw in r.name.lower()]
-
-
+ 
+ 
 @bot.hybrid_command(name="role", aliases=["r"], description="Add a role to a member, or remove it if they already have it")
 @app_commands.describe(member="Who to give the role to or take it from", role_name="Role name, e.g. baddiez")
 @commands.has_permissions(manage_roles=True)
@@ -1633,7 +1634,7 @@ async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_name: 
     if len(matches) > 1:
         names = "\n".join(f"• {r.name}" for r in matches[:5])
         return await reply(ctx, f"Several roles match **{role_name[:50]}**. Be more specific:\n{names}", "error", ephemeral=True)
-
+ 
     role = matches[0]
     if role.managed:
         return await reply(ctx, f"{role.mention} is managed by an integration, so it can't be given manually.", "error", ephemeral=True)
@@ -1641,7 +1642,7 @@ async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_name: 
         return await reply(ctx, f"{role.mention} is above my highest role. Move my role higher in Server Settings → Roles.", "error", ephemeral=True)
     if ctx.author.id != guild.owner_id and role >= ctx.author.top_role:
         return await reply(ctx, f"You can't manage {role.mention} because it's at or above your highest role.", "error", ephemeral=True)
-
+ 
     had_role = role in member.roles
     try:
         if had_role:
@@ -1652,7 +1653,7 @@ async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_name: 
         return await reply(ctx, "Discord wouldn't let me change that role. Check my permissions and role position.", "error", ephemeral=True)
     except discord.HTTPException as e:
         return await reply(ctx, f"Something went wrong changing the role: `{e}`", "error", ephemeral=True)
-
+ 
     embed = discord.Embed(
         title="➖  Role removed" if had_role else "➕  Role added",
         description=f"{role.mention} was {'removed from' if had_role else 'added to'} {member.mention}",
@@ -1661,8 +1662,8 @@ async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_name: 
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
     await ctx.send(embed=embed)
-
-
+ 
+ 
 @role_cmd.autocomplete("role_name")
 async def role_autocomplete(interaction: discord.Interaction, current: str):
     if not interaction.guild:
@@ -1679,11 +1680,11 @@ async def role_autocomplete(interaction: discord.Interaction, current: str):
         if len(choices) >= 25:
             break
     return choices
-
-
+ 
+ 
 # ------------------------------------------------------------------ server
-
-
+ 
+ 
 @bot.hybrid_command(name="setprefix", description="Change this server's command prefix (admins only)")
 @app_commands.describe(prefix="New prefix: up to 5 characters, no spaces")
 @commands.has_permissions(administrator=True)
@@ -1694,8 +1695,8 @@ async def setprefix(ctx: commands.Context, prefix: str):
     prefixes[str(ctx.guild.id)] = prefix
     save_prefixes()
     await reply(ctx, f"Prefix for this server is now `{prefix}`\nTry `{prefix}help`.", "success", "⚙️  Prefix updated", color=COLORS["mint"])
-
-
+ 
+ 
 @bot.hybrid_command(name="247", description="Toggle 24/7 mode: the bot stays in the voice channel")
 @commands.has_permissions(manage_guild=True)
 @app_commands.default_permissions(manage_guild=True)
@@ -1705,30 +1706,30 @@ async def stay_247(ctx: commands.Context):
         del stay247[key]
         save_stay247()
         return await reply(ctx, f"I'll leave the voice channel after {IDLE_TIMEOUT // 60} minutes of inactivity.", "success", "🌙  24/7 mode off", color=COLORS["cloud"])
-
+ 
     vc = ctx.voice_client
     if vc is None:
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await reply(ctx, "Join a voice channel first, then run this again.", "error", ephemeral=True)
         await ctx.defer()
         vc = await ctx.author.voice.channel.connect()
-
+ 
     stay247[key] = vc.channel.id
     save_stay247()
     await reply(ctx, f"I'll stay in **{vc.channel.name}** and rejoin if I get disconnected.\nRun the command again to turn it off.", "success", "☀️  24/7 mode on", color=COLORS["butter"])
-
-
+ 
+ 
 @bot.hybrid_command(name="prefix", description="Show this server's command prefix")
 async def prefix_cmd(ctx: commands.Context):
     p = prefix_for(ctx.guild)
     await reply(ctx, f"The prefix here is `{p}`\nYou can also mention me instead, and slash commands always work.", "info", "⚙️  Prefix", color=COLORS["powder"])
-
-
+ 
+ 
 # ------------------------------------------------------------------- about
-
+ 
 INVITE_PERMISSIONS = 281475248376832  # view/send/embed/history, connect/speak, manage roles, set voice status
-
-
+ 
+ 
 def fmt_uptime(seconds: float) -> str:
     seconds = int(seconds)
     days, rem = divmod(seconds, 86400)
@@ -1741,16 +1742,16 @@ def fmt_uptime(seconds: float) -> str:
         parts.append(f"{hours}h")
     parts.append(f"{minutes}m")
     return " ".join(parts)
-
-
+ 
+ 
 SMALL_CAPS = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ")
-
-
+ 
+ 
 def small_caps(text: str) -> str:
     """'created by' -> 'ᴄʀᴇᴀᴛᴇᴅ ʙʏ' (lower-case letters only)."""
     return text.translate(SMALL_CAPS)
-
-
+ 
+ 
 def script(text: str) -> str:
     """Bold script lettering: 'Mannat Player' -> '𝓜𝓪𝓷𝓷𝓪𝓽 𝓟𝓵𝓪𝔂𝓮𝓻'."""
     out = []
@@ -1762,30 +1763,30 @@ def script(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
-
-
+ 
+ 
 class AboutView(discord.ui.View):
     def __init__(self, invite_url: str, prefix: str):
         super().__init__(timeout=300)
         self.prefix = prefix
         self.add_item(discord.ui.Button(label="Invite me", emoji="💌", style=discord.ButtonStyle.link, url=invite_url))
-
+ 
     @discord.ui.button(label="Commands", emoji="📖", style=discord.ButtonStyle.secondary)
     async def commands_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(embed=help_embed("home", self.prefix), ephemeral=True)
-
-
+ 
+ 
 @bot.hybrid_command(name="about", aliases=["info", "botinfo"], description="Learn about the bot")
 async def about(ctx: commands.Context):
     me = bot.user
     p = prefix_for(ctx.guild)
-
+ 
     owner = None
     try:
         owner = (await bot.application_info()).owner
     except discord.HTTPException:
         pass
-
+ 
     embed = discord.Embed(
         description=(
             f"🎶 **{script('Your server’s personal DJ')}**\n"
@@ -1799,18 +1800,18 @@ async def about(ctx: commands.Context):
     embed.add_field(name=f"📅 {small_caps('created')}", value=discord.utils.format_dt(me.created_at, "D"), inline=True)
     embed.add_field(name=f"🌐 {small_caps('servers')}", value=f"`{len(bot.guilds)}`", inline=True)
     embed.set_footer(text=f"{small_caps('prefix')} {p}  •  {small_caps('up')} {fmt_uptime(time.time() - START_TIME)}")
-
+ 
     invite = discord.utils.oauth_url(
         me.id, permissions=discord.Permissions(INVITE_PERMISSIONS), scopes=("bot", "applications.commands")
     )
     await ctx.send(embed=embed, view=AboutView(invite, p))
-
-
+ 
+ 
 # ------------------------------------------------------------------- extras
-
+ 
 AR_MAX_PER_SERVER = 50
-
-
+ 
+ 
 def fmt_away(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 60:
@@ -1820,15 +1821,15 @@ def fmt_away(seconds: float) -> str:
     minutes = rem // 60
     parts = [f"{n}{u}" for n, u in ((days, "d"), (hours, "h"), (minutes, "m")) if n]
     return " ".join(parts)
-
-
+ 
+ 
 # ---- avatar
-
+ 
 def avatar_links(asset: discord.Asset) -> str:
     formats = ["png", "jpg", "webp"] + (["gif"] if asset.is_animated() else [])
     return " · ".join(f"[{f.upper()}]({asset.replace(size=1024, format=f).url})" for f in formats)
-
-
+ 
+ 
 @bot.hybrid_command(name="avatar", aliases=["av", "pfp"], description="Show someone's avatar")
 @app_commands.describe(member="Whose avatar to show (default: you)")
 async def avatar_cmd(ctx: commands.Context, member: Optional[discord.Member] = None):
@@ -1844,7 +1845,7 @@ async def avatar_cmd(ctx: commands.Context, member: Optional[discord.Member] = N
         if replied:
             target = replied.author
     target = target or ctx.author
-
+ 
     avatar = target.display_avatar
     embed = discord.Embed(
         title=f"{PLAYER_EMOJI} {target.display_name}’s Avatar",
@@ -1857,17 +1858,17 @@ async def avatar_cmd(ctx: commands.Context, member: Optional[discord.Member] = N
     if global_avatar and global_avatar.key != avatar.key:  # they have a server-specific avatar too
         embed.add_field(name="🌍 Global avatar", value=avatar_links(global_avatar), inline=False)
     embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
-
+ 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="Open original", emoji="🔗", style=discord.ButtonStyle.link, url=avatar.replace(size=4096).url))
     await ctx.send(embed=embed, view=view)
-
-
+ 
+ 
 # ---- afk
-
+ 
 afk_notice_times: dict[tuple[int, int], float] = {}
-
-
+ 
+ 
 @bot.hybrid_command(name="afk", aliases=["aft"], description="Mark yourself as AFK")
 @app_commands.describe(reason="Why you're away (optional)")
 async def afk_cmd(ctx: commands.Context, *, reason: str = "AFK"):
@@ -1876,13 +1877,13 @@ async def afk_cmd(ctx: commands.Context, *, reason: str = "AFK"):
     save_afk()
     await reply(ctx, f"{ctx.author.mention} is now AFK: **{reason}**\nI'll let people know if they mention you.",
                 "success", "💤  AFK set", color=COLORS["honey"])
-
-
+ 
+ 
 async def handle_afk(message: discord.Message, is_afk_command: bool):
     entries = afk_data.get(str(message.guild.id))
     if not entries:
         return
-
+ 
     uid = str(message.author.id)
     if uid in entries and not is_afk_command:  # they're talking again: welcome them back
         info = entries.pop(uid)
@@ -1894,7 +1895,7 @@ async def handle_afk(message: discord.Message, is_afk_command: bool):
             ),
             mention_author=False, delete_after=20,
         )
-
+ 
     notes, seen, now = [], set(), time.time()
     for member in message.mentions:  # tell people when someone they pinged is away
         if member.id in seen or member.id == message.author.id or member.bot:
@@ -1911,13 +1912,13 @@ async def handle_afk(message: discord.Message, is_afk_command: bool):
     if notes:
         await message.reply(embed=msg_embed("\n".join(notes), "info", "💤  AFK", color=COLORS["melon"]),
                             mention_author=False, delete_after=30)
-
-
+ 
+ 
 # ---- auto-responders
-
+ 
 ar_cooldowns: dict[tuple[int, str], float] = {}
-
-
+ 
+ 
 async def handle_autoresponders(message: discord.Message):
     entries = autoresponders.get(str(message.guild.id))
     if not entries or not message.content:
@@ -1936,8 +1937,8 @@ async def handle_autoresponders(message: discord.Message):
                .replace("{server}", message.guild.name))
         await message.reply(out[:2000], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         return
-
-
+ 
+ 
 @bot.hybrid_group(name="autoresponder", aliases=["ar"], description="Manage auto-responders (admins only)", invoke_without_command=True)
 @commands.has_permissions(administrator=True)
 @app_commands.default_permissions(administrator=True)
@@ -1951,8 +1952,8 @@ async def autoresponder(ctx: commands.Context):
         "info", "🤖  Auto-responders", color=COLORS["taffy"],
     )
     await ctx.send(embed=embed)
-
-
+ 
+ 
 @autoresponder.command(name="add", description="Add an auto-responder")
 @app_commands.describe(trigger="Word or phrase to react to", response="What I reply with. {user}, {username} and {server} work")
 @commands.has_permissions(administrator=True)
@@ -1964,7 +1965,7 @@ async def ar_add(ctx: commands.Context, trigger: str, *, response: str):
         return await reply(ctx, "Triggers can be at most 50 characters.", "error", ephemeral=True)
     if len(response) > 1000:
         return await reply(ctx, "Responses can be at most 1000 characters.", "error", ephemeral=True)
-
+ 
     entries = autoresponders.setdefault(str(ctx.guild.id), {})
     key = trigger.lower()
     existed = key in entries
@@ -1972,14 +1973,14 @@ async def ar_add(ctx: commands.Context, trigger: str, *, response: str):
         return await reply(ctx, f"This server already has {AR_MAX_PER_SERVER} auto-responders. Remove one first.", "error", ephemeral=True)
     entries[key] = {"trigger": trigger, "response": response}
     save_autoresponders()
-
+ 
     embed = msg_embed(f"Auto-responder {'updated' if existed else 'added'}.", "success",
                       "🤖  Updated" if existed else "🤖  Added", color=COLORS["pistachio"])
     embed.add_field(name="🎯 Trigger", value=f"`{trigger}`", inline=True)
     embed.add_field(name="💬 Response", value=response[:500], inline=True)
     await ctx.send(embed=embed)
-
-
+ 
+ 
 @autoresponder.command(name="remove", aliases=["delete"], description="Remove an auto-responder")
 @app_commands.describe(trigger="The trigger to remove")
 @commands.has_permissions(administrator=True)
@@ -1991,15 +1992,15 @@ async def ar_remove(ctx: commands.Context, *, trigger: str):
                            "error", ephemeral=True)
     save_autoresponders()
     await reply(ctx, f"Removed the auto-responder for **{entry['trigger']}**.", "success", "🗑️  Removed", color=COLORS["rosewater"])
-
-
+ 
+ 
 @ar_remove.autocomplete("trigger")
 async def ar_remove_autocomplete(interaction: discord.Interaction, current: str):
     entries = autoresponders.get(str(interaction.guild.id), {}) if interaction.guild else {}
     cur = current.lower()
     return [app_commands.Choice(name=e["trigger"][:100], value=e["trigger"][:100]) for k, e in entries.items() if cur in k][:25]
-
-
+ 
+ 
 @autoresponder.command(name="list", aliases=["all"], description="Show every auto-responder in this server")
 @commands.has_permissions(administrator=True)
 async def ar_list(ctx: commands.Context):
@@ -2014,10 +2015,10 @@ async def ar_list(ctx: commands.Context):
     embed = discord.Embed(title="🤖  Auto-responders", description="\n".join(lines), color=discord.Color(COLORS["ice"]))
     embed.set_footer(text=f"{len(entries)} of {AR_MAX_PER_SERVER}  •  {PLAYER_NAME}")
     await ctx.send(embed=embed)
-
-
+ 
+ 
 # -------------------------------------------------------------------- help
-
+ 
 HELP_PAGES = {
     "home": (
         f"{PLAYER_NAME} Help",
@@ -2074,8 +2075,8 @@ HELP_PAGES = {
         ],
     ),
 }
-
-
+ 
+ 
 HELP_PAGES["extras"] = (
     "Extra Commands",
     "Handy little extras.",
@@ -2085,8 +2086,8 @@ HELP_PAGES["extras"] = (
         ("/autoresponder", "**Admins only.** `add <trigger> <response>`, `remove <trigger>` and `list` manage the replies I send when someone says a trigger. Alias: `{p}ar`"),
     ],
 )
-
-
+ 
+ 
 def help_embed(key: str, p: str) -> discord.Embed:
     title, desc, fields = HELP_PAGES[key]
     embed = discord.Embed(title=title, description=desc.format(p=p), color=discord.Color(COLORS["periwinkle"]))
@@ -2095,15 +2096,15 @@ def help_embed(key: str, p: str) -> discord.Embed:
         embed.add_field(name=name, value=value.format(p=p), inline=False)
     embed.set_footer(text=f"Prefix: {p}  |  Use the menu to switch categories")
     return embed
-
-
+ 
+ 
 class HelpView(discord.ui.View):
     def __init__(self, author_id: int, p: str):
         super().__init__(timeout=120)
         self.author_id = author_id
         self.p = p
         self.message: discord.Message | None = None
-
+ 
     @discord.ui.select(
         placeholder="Choose a category...",
         options=[
@@ -2117,19 +2118,19 @@ class HelpView(discord.ui.View):
     )
     async def select_category(self, interaction: discord.Interaction, select: discord.ui.Select):
         await interaction.response.edit_message(embed=help_embed(select.values[0], self.p), view=self)
-
+ 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         await interaction.message.delete()
         self.stop()
-
+ 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await ireply(interaction, "This menu belongs to someone else. Run the help command to get your own.")
             return False
         return True
-
+ 
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
@@ -2138,15 +2139,15 @@ class HelpView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
-
-
+ 
+ 
 @bot.hybrid_command(name="help", description="Show all commands")
 async def help_cmd(ctx: commands.Context):
     p = prefix_for(ctx.guild)
     view = HelpView(ctx.author.id, p)
     view.message = await ctx.send(embed=help_embed("home", p), view=view)
-
-
+ 
+ 
 async def main():
     if os.getenv("PORT"):  # only on hosts that provide a PORT (e.g. Render)
         await start_web_server()  # up before login, so the host sees the service as alive
@@ -2159,10 +2160,11 @@ async def main():
                 print("Discord returned 429 (rate limited). Waiting 15 minutes before exiting/retrying...")
                 await asyncio.sleep(900)
             raise
-
-
+ 
+ 
 if not TOKEN:
     raise SystemExit("Set DISCORD_TOKEN in your .env file.")
-
+ 
 discord.utils.setup_logging()
 asyncio.run(main())
+ 
