@@ -37,6 +37,9 @@ IDLE_TIMEOUT = 300  # seconds before leaving an idle/empty channel (when 24/7 mo
 STATUS_EMOJI = os.getenv("STATUS_EMOJI", "<a:Music:1565878360054173877>")  # shown before the song in the voice channel status
 START_TIME = time.time()
 NO_COOKIE_CLIENTS = {"android_vr", "android", "ios"}  # these YouTube clients don't accept cookies
+DEFAULT_SOURCE = "soundcloud" if os.getenv("DEFAULT_SOURCE", "youtube").strip().lower() in ("soundcloud", "sc") else "youtube"
+SOUNDCLOUD_FALLBACK = os.getenv("SOUNDCLOUD_FALLBACK", "off").strip().lower() in ("on", "1", "true", "yes")
+YT_PROXY = os.getenv("YT_PROXY")  # optional, e.g. http://user:pass@host:port
 YT_PLAYER_CLIENT = os.getenv("YT_PLAYER_CLIENT")  # optional: force one YouTube client (e.g. android_vr)
 YT_FALLBACK_CLIENTS = [c.strip() for c in os.getenv("YT_FALLBACK_CLIENTS", "android_vr,tv,mweb,web_safari").split(",") if c.strip()]
  
@@ -47,6 +50,8 @@ YTDL_OPTS = {
     "ignore_no_formats_error": True,  # looking up a title shouldn't fail just because no audio format is offered right now
     "source_address": "0.0.0.0",
 }
+if YT_PROXY:
+    YTDL_OPTS["proxy"] = YT_PROXY
 if YT_PLAYER_CLIENT:
     YTDL_OPTS["extractor_args"] = {"youtube": {"player_client": [YT_PLAYER_CLIENT]}}
  
@@ -303,6 +308,10 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
  
  
+rejoin_fails: dict[str, int] = {}
+rejoin_after: dict[str, float] = {}
+ 
+ 
 @tasks.loop(seconds=30)
 async def voice_maintenance():
     # 1) Leave idle or empty channels (skipped for servers with 24/7 mode on)
@@ -339,13 +348,28 @@ async def voice_maintenance():
             del stay247[key]
             changed = True
             continue
+        if time.monotonic() < rejoin_after.get(key, 0):  # backing off after earlier failures
+            continue
         try:
             if vc:
                 await vc.disconnect(force=True)
-            await channel.connect()
+            await asyncio.wait_for(channel.connect(), timeout=30)
+            rejoin_fails.pop(key, None)
             print(f"24/7: rejoined {channel.name} in {guild.name}")
         except Exception as e:
-            print(f"24/7: could not rejoin {channel.name} in {guild.name}: {e}")
+            # Wait longer after each failure (30s, 60s, 2m ... up to 15m) instead of hammering Discord.
+            # A common cause: the same bot token is already connected to that channel from somewhere else.
+            fails = rejoin_fails.get(key, 0) + 1
+            rejoin_fails[key] = fails
+            wait = min(30 * 2 ** fails, 900)
+            rejoin_after[key] = time.monotonic() + wait
+            print(f"24/7: could not rejoin {channel.name} in {guild.name} ({e!r}); trying again in {wait}s")
+            stuck = guild.voice_client
+            if stuck:
+                try:
+                    await stuck.disconnect(force=True)
+                except Exception:
+                    pass
     if changed:
         save_stay247()
  
@@ -414,7 +438,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 # ----------------------------------------------------------------- helpers
  
  
-def build_query(query: str, source: str = "youtube") -> str:
+def build_query(query: str, source: str = DEFAULT_SOURCE) -> str:
     """Links are used as-is; plain text becomes a search on the chosen source."""
     if query.startswith(("http://", "https://")):
         return query
@@ -423,11 +447,11 @@ def build_query(query: str, source: str = "youtube") -> str:
  
  
 def parse_source(query: str) -> tuple[str, str]:
-    """'sc: song' -> soundcloud, 'yt: song' -> youtube, otherwise YouTube."""
+    """'sc: song' -> soundcloud, 'yt: song' -> youtube, otherwise the default source."""
     m = re.match(r"^(yt|youtube|sc|soundcloud)\s*:\s*(.+)$", query.strip(), re.IGNORECASE | re.DOTALL)
     if m:
         return ("youtube" if m.group(1).lower() in ("yt", "youtube") else "soundcloud"), m.group(2).strip()
-    return "youtube", query.strip()
+    return DEFAULT_SOURCE, query.strip()
  
  
 async def extract(query: str, exclude: set | None = None) -> dict:
@@ -473,6 +497,30 @@ async def extract(query: str, exclude: set | None = None) -> dict:
         if YTDL_OPTS.get("cookiefile") and broken_cookies:
             print("Request failed with cookies; retrying without them")
             return await loop.run_in_executor(None, run, {k: v for k, v in YTDL_OPTS.items() if k != "cookiefile"})
+        raise
+ 
+ 
+def looks_blocked(info: dict) -> bool:
+    """True when YouTube answered but offered no audio at all (blocked server, bot check, rate limit)."""
+    return "youtube" in (info.get("extractor_key") or "").lower() and not info.get("formats") and not info.get("url")
+ 
+ 
+async def smart_extract(text: str, source: str) -> dict:
+    """Look a song up; if YouTube is blocking this server, search SoundCloud instead."""
+    is_link = text.startswith(("http://", "https://"))
+    try:
+        info = await extract(build_query(text, source))
+        if looks_blocked(info):
+            raise ValueError("not a bot: YouTube offered no audio formats")
+        return info
+    except Exception as e:
+        blocked = "not a bot" in str(e) or "429" in str(e)
+        if source == "youtube" and blocked:
+            if SOUNDCLOUD_FALLBACK and not is_link:
+                print("YouTube blocked this search; falling back to SoundCloud")
+                return await extract(build_query(text, "soundcloud"))
+            raise ValueError("YouTube is blocking this server right now (it asked for a sign-in or is rate limiting me). "
+                             "Hosting me from a home connection, or through a proxy, fixes this.")
         raise
  
  
@@ -995,6 +1043,8 @@ async def play_next(guild: discord.Guild, announce: bool = False):
                 use_cookies = bool(YTDL_OPTS.get("cookiefile")) and client not in NO_COOKIE_CLIENTS
             else:
                 client, use_cookies = YT_ATTEMPTS[min(track.attempt, len(YT_ATTEMPTS) - 1)]
+            if YT_PROXY:
+                cmd += ["--proxy", YT_PROXY]
             if use_cookies:
                 cmd += ["--cookies", YTDL_OPTS["cookiefile"]]
             if client:
@@ -1076,14 +1126,12 @@ async def play_next(guild: discord.Guild, announce: bool = False):
         if forbidden and not bot_check:
             details = (
                 "\n\n**YouTube wouldn't hand over the audio** (it answered 403 or offered no usable format), even after trying other methods. "
-                "Restarting me updates yt-dlp, which often fixes this, and fresh cookies can help too. "
-                "Meanwhile, `sc:` searches still work, like `/play sc: song name`."
+                "Restarting me updates yt-dlp, which often fixes this, and fresh cookies can help too."
             )
         if bot_check:
             details = (
                 "\n\n**YouTube is asking me to prove I'm not a bot.** This usually clears up after a while. "
-                "To fix it for good, put a `cookies.txt` file in my folder. "
-                "Meanwhile, `sc:` searches still work, like `/play sc: song name`."
+                "To fix it for good, put a `cookies.txt` file in my folder, or host me from a home connection."
             )
         if err:
             asyncio.run_coroutine_threadsafe(notify(state, f"Playback error: `{err}`"), bot.loop)
@@ -1289,13 +1337,7 @@ async def load_playlist(url: str, user: discord.abc.User):
 async def resolve_track(track: Track):
     """Spotify entries are matched to a YouTube video just before they play."""
     if track.search_query:
-        try:
-            info = await extract(build_query(track.search_query, "youtube"))
-        except Exception as e:
-            if "not a bot" not in str(e):
-                raise
-            print("YouTube blocked this search; falling back to SoundCloud")
-            info = await extract(build_query(track.search_query, "soundcloud"))
+        info = await smart_extract(track.search_query, DEFAULT_SOURCE)
         track.play_url = info.get("webpage_url") or info["url"]
         track.platform = (info.get("extractor_key") or "YouTube").upper()
         track.duration = info.get("duration") or track.duration
@@ -1362,13 +1404,7 @@ async def play(ctx: commands.Context, *, query: str):
             meta, tracks = await load_playlist(query, ctx.author)
         else:
             source, text = parse_source(query)
-            try:
-                info = await extract(build_query(text, source))
-            except Exception as e:
-                if source != "youtube" or "not a bot" not in str(e):
-                    raise
-                print("YouTube blocked this search; falling back to SoundCloud")
-                info = await extract(build_query(text, "soundcloud"))
+            info = await smart_extract(text, source)
             tracks = [track_from_info(info, ctx.author)]
     except Exception as e:
         return await reply(ctx, f"Couldn't find that track.\n```{str(e)[:500]}```", "error")
@@ -2037,7 +2073,7 @@ HELP_PAGES = {
         "Playback Commands",
         "Control what's playing.",
         [
-            ("/play <song or link>", "Play a song or add it to the queue. Accepts names, links, **Spotify tracks/albums/playlists** and YouTube/SoundCloud playlists. Searches YouTube; start with `sc:` for SoundCloud. Alias: `{p}p`"),
+            ("/play <song or link>", "Play a song or add it to the queue. Accepts names, links, **Spotify tracks/albums/playlists** and YouTube/SoundCloud playlists. Start with `yt:` for YouTube or `sc:` for SoundCloud. Alias: `{p}p`"),
             ("/skip", "Skip the current song. Alias: `{p}s`"),
             ("/pause", "Pause playback."),
             ("/resume", "Resume playback."),
